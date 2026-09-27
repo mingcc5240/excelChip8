@@ -1,0 +1,288 @@
+Option Explicit
+
+#If VBA7 Then
+    Public Declare PtrSafe Function GetAsyncKeyState Lib "user32" (ByVal vKey As Long) As Integer
+    Public Declare PtrSafe Sub Sleep Lib "kernel32" (ByVal dwMilliseconds As Long)
+    Public Declare PtrSafe Function QueryPerformanceCounter Lib "kernel32" (ByRef lpPerformanceCount As Currency) As Long
+    Public Declare PtrSafe Function QueryPerformanceFrequency Lib "kernel32" (ByRef lpFrequency As Currency) As Long
+    Public Declare PtrSafe Function MessageBeep Lib "user32" (ByVal uType As Long) As Long
+    
+    ' DPI 및 화면 정밀 측정 API
+    Public Declare PtrSafe Function GetDC Lib "user32" (ByVal hwnd As LongPtr) As LongPtr
+    Public Declare PtrSafe Function ReleaseDC Lib "user32" (ByVal hwnd As LongPtr, ByVal hdc As LongPtr) As Long
+    Public Declare PtrSafe Function GetDeviceCaps Lib "gdi32" (ByVal hdc As LongPtr, ByVal nIndex As Long) As Long
+    Public Declare PtrSafe Function FindWindow Lib "user32" Alias "FindWindowA" (ByVal lpClassName As String, ByVal lpWindowName As String) As LongPtr
+    
+    ' DIB 초고속 렌더링 API
+    Public Declare PtrSafe Function StretchDIBits Lib "gdi32" ( _
+        ByVal hdc As LongPtr, ByVal xDest As Long, ByVal yDest As Long, ByVal destWidth As Long, ByVal destHeight As Long, _
+        ByVal xSrc As Long, ByVal ySrc As Long, ByVal srcWidth As Long, ByVal srcHeight As Long, _
+        ByRef lpBits As Any, ByRef lpBitsInfo As BITMAPINFO, ByVal wUsage As Long, ByVal dwRop As Long) As Long
+#Else
+    Public Declare Function GetAsyncKeyState Lib "user32" (ByVal vKey As Long) As Integer
+    Public Declare Sub Sleep Lib "kernel32" (ByVal dwMilliseconds As Long)
+    Public Declare Function QueryPerformanceCounter Lib "kernel32" (ByRef lpPerformanceCount As Currency) As Long
+    Public Declare Function QueryPerformanceFrequency Lib "kernel32" (ByRef lpFrequency As Currency) As Long
+    Public Declare Function MessageBeep Lib "user32" (ByVal uType As Long) As Long
+    
+    Public Declare Function GetDC Lib "user32" (ByVal hwnd As Long) As Long
+    Public Declare Function ReleaseDC Lib "user32" (ByVal hwnd As Long, ByVal hdc As Long) As Long
+    Public Declare Function GetDeviceCaps Lib "gdi32" (ByVal hdc As Long, ByVal nIndex As Long) As Long
+    Public Declare Function FindWindow Lib "user32" Alias "FindWindowA" (ByVal lpClassName As String, ByVal lpWindowName As String) As Long
+    
+    Public Declare Function StretchDIBits Lib "gdi32" ( _
+        ByVal hdc As Long, ByVal xDest As Long, ByVal yDest As Long, ByVal destWidth As Long, ByVal destHeight As Long, _
+        ByVal xSrc As Long, ByVal ySrc As Long, ByVal srcWidth As Long, ByVal srcHeight As Long, _
+        ByRef lpBits As Any, ByRef lpBitsInfo As BITMAPINFO, ByVal wUsage As Long, ByVal dwRop As Long) As Long
+#End If
+
+Public Type BITMAPINFOHEADER
+    biSize As Long
+    biWidth As Long
+    biHeight As Long
+    biPlanes As Integer
+    biBitCount As Integer
+    biCompression As Long
+    biSizeImage As Long
+    biXPelsPerMeter As Long
+    biYPelsPerMeter As Long
+    biClrUsed As Long
+    biClrImportant As Long
+End Type
+
+Public Type BITMAPINFO
+    bmiHeader As BITMAPINFOHEADER
+    bmiColors(0 To 3) As Byte
+End Type
+
+Public Const LOGPIXELSX As Long = 88
+Public Const LOGPIXELSY As Long = 90
+Public Const DIB_RGB_COLORS As Long = 0
+Public Const SRCCOPY As Long = &HCC0020
+
+' 기존 글로벌 변수 및 CHIP-8 코드는 동일하게 유지...
+
+' Global CHIP-8 Variables
+Public Memory(0 To 4095) As Byte
+Public V(0 To 15) As Byte
+Public i As Long
+Public PC As Long
+Public Stack(0 To 15) As Long
+Public SP As Long
+Public DisplayBuffer(0 To 63, 0 To 31) As Byte
+Public KeyState(0 To 15) As Boolean
+Public DelayTimer As Byte
+Public SoundTimer As Byte
+Public IsRunning As Boolean
+
+Private BitMask(0 To 7) As Byte
+
+Private Function GetFontSet() As Variant
+    GetFontSet = Array( _
+        &HF0, &H90, &H90, &H90, &HF0, _
+        &H20, &H60, &H20, &H20, &H70, _
+        &HF0, &H10, &HF0, &H80, &HF0, _
+        &HF0, &H10, &HF0, &H10, &HF0, _
+        &H90, &H90, &HF0, &H10, &H10, _
+        &HF0, &H80, &HF0, &H10, &HF0, _
+        &HF0, &H80, &HF0, &H90, &HF0, _
+        &HF0, &H10, &H20, &H40, &H40, _
+        &HF0, &H90, &HF0, &H90, &HF0, _
+        &HF0, &H90, &HF0, &H10, &HF0, _
+        &HF0, &H90, &HF0, &H90, &H90, _
+        &HE0, &H90, &HE0, &H90, &HE0, _
+        &HF0, &H80, &H80, &H80, &HF0, _
+        &HE0, &H90, &H90, &H90, &HE0, _
+        &HF0, &H80, &HF0, &H80, &HF0, _
+        &HF0, &H80, &HF0, &H80, &H80 _
+    )
+End Function
+
+Public Sub InitBitMask()
+    BitMask(0) = &H80: BitMask(1) = &H40
+    BitMask(2) = &H20: BitMask(3) = &H10
+    BitMask(4) = &H8:  BitMask(5) = &H4
+    BitMask(6) = &H2:  BitMask(7) = &H1
+End Sub
+
+Public Sub ResetSystem()
+    Dim k As Long
+    For k = 0 To 4095: Memory(k) = 0: Next k
+    For k = 0 To 15: V(k) = 0: Stack(k) = 0: KeyState(k) = False: Next k
+    For k = 0 To 63
+        Dim gy As Long
+        For gy = 0 To 31: DisplayBuffer(k, gy) = 0: Next gy
+    Next k
+    
+    PC = &H200: i = 0: SP = 0
+    DelayTimer = 0: SoundTimer = 0
+    
+    Dim fonts As Variant: fonts = GetFontSet()
+    For k = 0 To UBound(fonts)
+        Memory(&H50 + k) = CByte(fonts(k))
+    Next k
+    
+    Call InitBitMask
+End Sub
+
+Public Sub LoadExternalROM()
+    Dim fd As FileDialog
+    Dim selectedFilePath As String
+    Dim fileNum As Integer, fileSize As Long
+    Dim romData() As Byte, i As Long
+    
+    Set fd = Application.FileDialog(msoFileDialogFilePicker)
+    With fd
+        .Title = "CHIP-8 ROM 파일(.ch8) 선택"
+        .Filters.Clear
+        .Filters.Add "CHIP-8 ROM Files", "*.ch8; *.rom"
+        .Filters.Add "All Files", "*.*"
+        If .Show = -1 Then selectedFilePath = .SelectedItems(1) Else Exit Sub
+    End With
+    
+    fileNum = FreeFile
+    Open selectedFilePath For Binary Access Read As #fileNum
+    fileSize = LOF(fileNum)
+    
+    If fileSize = 0 Then Close #fileNum: Exit Sub
+    
+    ReDim romData(0 To fileSize - 1)
+    Get #fileNum, , romData
+    Close #fileNum
+    
+    Call ResetSystem
+    For i = 0 To UBound(romData)
+        If (&H200 + i) <= 4095 Then Memory(&H200 + i) = romData(i)
+    Next i
+    
+    ' UserForm 띄우기
+    UserForm1.Show vbModeless
+End Sub
+
+Public Sub UpdateInputState()
+    If (GetAsyncKeyState(&H1B) And &H8000) <> 0 Then
+        IsRunning = False
+        Exit Sub
+    End If
+    
+    KeyState(0) = (GetAsyncKeyState(&H58) And &H8000) <> 0 ' X
+    KeyState(1) = (GetAsyncKeyState(&H31) And &H8000) <> 0 ' 1
+    KeyState(2) = (GetAsyncKeyState(&H32) And &H8000) <> 0 ' 2
+    KeyState(3) = (GetAsyncKeyState(&H33) And &H8000) <> 0 ' 3
+    KeyState(4) = (GetAsyncKeyState(&H51) And &H8000) <> 0 ' Q
+    KeyState(5) = (GetAsyncKeyState(&H57) And &H8000) <> 0 ' W
+    KeyState(6) = (GetAsyncKeyState(&H45) And &H8000) <> 0 ' E
+    KeyState(7) = (GetAsyncKeyState(&H41) And &H8000) <> 0 ' A
+    KeyState(8) = (GetAsyncKeyState(&H53) And &H8000) <> 0 ' S
+    KeyState(9) = (GetAsyncKeyState(&H44) And &H8000) <> 0 ' D
+    KeyState(10) = (GetAsyncKeyState(&H5A) And &H8000) <> 0 ' Z
+    KeyState(11) = (GetAsyncKeyState(&H43) And &H8000) <> 0 ' C
+    KeyState(12) = (GetAsyncKeyState(&H34) And &H8000) <> 0 ' 4
+    KeyState(13) = (GetAsyncKeyState(&H52) And &H8000) <> 0 ' R
+    KeyState(14) = (GetAsyncKeyState(&H46) And &H8000) <> 0 ' F
+    KeyState(15) = (GetAsyncKeyState(&H56) And &H8000) <> 0 ' V
+End Sub
+
+Public Sub EmulateCycle()
+    Dim b1 As Long, b2 As Long
+    b1 = Memory(PC): b2 = Memory(PC + 1)
+    Dim Opcode As Long: Opcode = b1 * 256 + b2
+    If Opcode = 0 Then Exit Sub
+    PC = PC + 2
+    
+    Dim x As Long, y As Long, NNN As Long, NN As Long, N As Long
+    x = (b1 And &HF): y = (b2 And &HF0) \ &H10
+    NNN = Opcode And &HFFF&: NN = b2: N = b2 And &HF
+    Dim gx As Long, gy As Long, sumVal As Long, k As Long, keyFound As Boolean
+    
+    Select Case (b1 And &HF0)
+        Case &H0
+            Select Case Opcode
+                Case &HE0
+                    For gx = 0 To 63
+                        For gy = 0 To 31: DisplayBuffer(gx, gy) = 0: Next gy
+                    Next gx
+                Case &HEE
+                    If SP > 0 Then SP = SP - 1: PC = Stack(SP)
+            End Select
+        Case &H10: PC = NNN
+        Case &H20: Stack(SP) = PC: SP = SP + 1: PC = NNN
+        Case &H30: If V(x) = NN Then PC = PC + 2
+        Case &H40: If V(x) <> NN Then PC = PC + 2
+        Case &H50: If V(x) = V(y) Then PC = PC + 2
+        Case &H60: V(x) = NN
+        Case &H70: V(x) = (CLng(V(x)) + NN) And &HFF&
+        Case &H80
+            Select Case N
+                Case &H0: V(x) = V(y)
+                Case &H1: V(x) = V(x) Or V(y)
+                Case &H2: V(x) = V(x) And V(y)
+                Case &H3: V(x) = V(x) Xor V(y)
+                Case &H4: sumVal = CLng(V(x)) + CLng(V(y)): V(&HF) = IIf(sumVal > 255, 1, 0): V(x) = sumVal And &HFF&
+                Case &H5: V(&HF) = IIf(V(x) >= V(y), 1, 0): V(x) = (CLng(V(x)) - CLng(V(y)) + 256) And &HFF&
+                Case &H6: V(&HF) = V(x) And &H1: V(x) = V(x) \ 2
+                Case &H7: V(&HF) = IIf(V(y) >= V(x), 1, 0): V(x) = (CLng(V(y)) - CLng(V(x)) + 256) And &HFF&
+                Case &HE: V(&HF) = IIf((V(x) And &H80) <> 0, 1, 0): V(x) = (CLng(V(x)) * 2) And &HFF&
+            End Select
+        Case &H90: If V(x) <> V(y) Then PC = PC + 2
+        Case &HA0: i = NNN
+        Case &HB0: PC = NNN + V(0)
+        Case &HC0: V(x) = CByte(Int(Rnd() * 256)) And NN
+        Case &HD0
+            Dim vx As Long, vy As Long, row As Long, bitIdx As Long, spriteByte As Byte
+            vx = V(x) Mod 64: vy = V(y) Mod 32: V(&HF) = 0
+            For row = 0 To N - 1
+                If (vy + row) < 32 Then
+                    spriteByte = Memory(i + row)
+                    For bitIdx = 0 To 7
+                        If (vx + bitIdx) < 64 Then
+                            If (spriteByte And BitMask(bitIdx)) <> 0 Then
+                                If DisplayBuffer(vx + bitIdx, vy + row) = 1 Then V(&HF) = 1
+                                DisplayBuffer(vx + bitIdx, vy + row) = DisplayBuffer(vx + bitIdx, vy + row) Xor 1
+                            End If
+                        End If
+                    Next bitIdx
+                End If
+            Next row
+        Case &HE0
+            Select Case NN
+                Case &H9E: If KeyState(V(x) And &HF) = True Then PC = PC + 2
+                Case &HA1: If KeyState(V(x) And &HF) = False Then PC = PC + 2
+            End Select
+        Case &HF0
+            Select Case NN
+                Case &H7: V(x) = DelayTimer
+                Case &HA
+                    keyFound = False
+                    For k = 0 To 15
+                        If KeyState(k) = True Then V(x) = k: keyFound = True: Exit For
+                    Next k
+                    If Not keyFound Then PC = PC - 2
+                Case &H15: DelayTimer = V(x)
+                Case &H18: SoundTimer = V(x)
+                Case &H1E: i = i + V(x)
+                Case &H29: i = &H50 + ((V(x) And &HF) * 5)
+                Case &H33: Memory(i) = V(x) \ 100: Memory(i + 1) = (V(x) \ 10) Mod 10: Memory(i + 2) = V(x) Mod 10
+                Case &H55: For k = 0 To x: Memory(i + k) = V(k): Next k
+                Case &H65: For k = 0 To x: V(k) = Memory(i + k): Next k
+            End Select
+    End Select
+    
+    'If DelayTimer > 0 Then DelayTimer = DelayTimer - 1
+    'If SoundTimer > 0 Then SoundTimer = SoundTimer - 1
+    
+    ' DelayTimer 및 SoundTimer 차감 처리
+    If DelayTimer > 0 Then DelayTimer = DelayTimer - 1
+    
+    If SoundTimer > 0 Then
+        Call MessageBeep(&HFFFFFFFF) ' 기본 윈도우 비프음 즉시 발생 (Non-blocking)
+        SoundTimer = SoundTimer - 1
+    End If
+
+    'If SoundTimer > 0 Then
+        ' SoundTimer가 0보다 크면 440Hz(라 음) 주파수로 16ms 동안 소리 재생
+    '    Call Beep(440, 16)
+    '    SoundTimer = SoundTimer - 1
+    'End If
+End Sub
+

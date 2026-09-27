@@ -1,0 +1,137 @@
+Option Explicit
+
+#If VBA7 Then
+    Private FormHWND As LongPtr
+    Private FormDC As LongPtr
+#Else
+    Private FormHWND As Long
+    Private FormDC As Long
+#End If
+
+Private bmpInfo As BITMAPINFO
+Private PixelData(0 To 63, 0 To 31) As Long ' 32비트 ARGB 픽셀 직접 메모리 배열
+Private ScaleX As Double
+Private ScaleY As Double
+
+Private Sub InitDIB()
+    FormHWND = FindWindow("ThunderDFrame", Me.Caption)
+    FormDC = GetDC(FormHWND)
+    
+    ' 시스템 DPI (화면 배율) 자동 구하기
+    Dim dpiX As Long, dpiY As Long
+    dpiX = GetDeviceCaps(FormDC, LOGPIXELSX)
+    dpiY = GetDeviceCaps(FormDC, LOGPIXELSY)
+    
+    If dpiX = 0 Then dpiX = 96
+    If dpiY = 0 Then dpiY = 96
+    
+    ' Point -> Pixel 변환 스케일값 연산 (96 DPI 기준)
+    ScaleX = dpiX / 72#
+    ScaleY = dpiY / 72#
+    
+    ' DIB 헤더 설정 (64x32 32비트 BGRA 비트맵)
+    With bmpInfo.bmiHeader
+        .biSize = Len(bmpInfo.bmiHeader)
+        .biWidth = 64
+        .biHeight = -32 ' 음수로 설정 시 Top-Down (위에서 아래로 스캔)
+        .biPlanes = 1
+        .biBitCount = 32
+        .biCompression = 0 ' BI_RGB
+    End With
+End Sub
+
+' 초고속 DIB 메모리 비트 블록 전송 (SetPixel 대비 100배 이상 빠름)
+Private Sub RenderFormDisplay()
+    Dim x As Long, y As Long
+    Dim greenRGB As Long, blackRGB As Long
+    
+    greenRGB = &HFF00FF40 ' 32비트 ARGB (초록)
+    blackRGB = &HFF000000 ' 32비트 ARGB (검정)
+    
+    ' 1. 메모리 배열 직접 조작
+    For y = 0 To 31
+        For x = 0 To 63
+            If DisplayBuffer(x, y) = 1 Then
+                PixelData(x, y) = greenRGB
+            Else
+                PixelData(x, y) = blackRGB
+            End If
+        Next x
+    Next y
+    
+    ' 2. Frame1 컨트롤의 위치 및 크기를 픽셀 단위로 정밀 연산
+    ' UserForm 상단 제목 표시줄(Titlebar) 및 테두리 두께 보정
+    Dim framePixelLeft As Long, framePixelTop As Long
+    Dim framePixelWidth As Long, framePixelHeight As Long
+    
+    ' 윈도우 창 캡션/테두리 여백 약 8px, 30px 보정
+    framePixelLeft = CLng((Frame1.Left + 4) * ScaleX)
+    framePixelTop = CLng((Frame1.Top + 24) * ScaleY)
+    framePixelWidth = CLng(Frame1.Width * ScaleX)
+    framePixelHeight = CLng(Frame1.Height * ScaleY)
+    
+    ' 3. StretchDIBits API로 메모리 배열을 Frame1 위치에 단 1번의 호출로 전송
+    Call StretchDIBits(FormDC, framePixelLeft, framePixelTop, framePixelWidth, framePixelHeight, _
+                        0, 0, 64, 32, _
+                        PixelData(0, 0), bmpInfo, DIB_RGB_COLORS, SRCCOPY)
+End Sub
+
+Private Sub UserForm_Activate()
+    Call InitDIB
+    IsRunning = True
+    
+    Dim freq As Currency, startCount As Currency, endCount As Currency
+    Dim targetFrameTime As Double, elapsedTime As Double
+    
+    Dim fpsStartCount As Currency, fpsCurrentCount As Currency
+    Dim frameCounter As Long, fpsTimeElapsed As Double
+    
+    Call QueryPerformanceFrequency(freq)
+    targetFrameTime = 1# / 60# ' 약 0.016667초 (60 FPS)
+    
+    Call QueryPerformanceCounter(fpsStartCount)
+    frameCounter = 0
+    
+    Do While IsRunning
+        Call QueryPerformanceCounter(startCount)
+        
+        ' 1. 입력 감지
+        Call UpdateInputState
+        
+        ' 2. CHIP-8 CPU 사이클 실행 (프레임당 8~10 사이클)
+        Dim i As Long
+        For i = 1 To 9
+            Call EmulateCycle
+        Next i
+        
+        ' 3. 화면 고속 렌더링
+        Call RenderFormDisplay
+        
+        ' 4. FPS 측정을 위한 카운트 증가 및 표시
+        frameCounter = frameCounter + 1
+        Call QueryPerformanceCounter(fpsCurrentCount)
+        fpsTimeElapsed = (fpsCurrentCount - fpsStartCount) / freq
+        
+        If fpsTimeElapsed >= 0.5 Then ' 0.5초마다 FPS 갱신하여 빠른 피드백 제공
+            Me.Caption = "CHIP-8 Emulator | FPS: " & Format(frameCounter / fpsTimeElapsed, "0.0")
+            frameCounter = 0
+            fpsStartCount = fpsCurrentCount
+        End If
+        
+        ' 5. UI 이벤트 처리 (부하 방지를 위해 DoEvents 최소화)
+        DoEvents
+        
+        ' 6. 精密(정밀) 60 FPS 스로틀링 (Sleep 1 제어 제거하여 45 FPS 병목 해결)
+        Do
+            Call QueryPerformanceCounter(endCount)
+            elapsedTime = (endCount - startCount) / freq
+        Loop While elapsedTime < targetFrameTime
+    Loop
+    
+    If FormDC <> 0 Then Call ReleaseDC(FormHWND, FormDC)
+End Sub
+Private Sub UserForm_QueryClose(Cancel As Integer, CloseMode As Integer)
+    IsRunning = False
+    If FormDC <> 0 Then Call ReleaseDC(FormHWND, FormDC)
+End Sub
+
